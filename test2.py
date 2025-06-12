@@ -855,9 +855,13 @@ def show_attack_statistics():
 
 def show_menu():
     """Show the main menu interface"""
-    # Run Tor detection at startup
-    if detect_tor_connection():
-        input(f"{COLORS['red']}Tor network detected at startup! This may affect firewall functionality.{COLORS['reset']}\nPress Enter to continue...")
+    try:
+        # Run Tor detection at startup
+        if detect_tor_connection():
+            input(f"{COLORS['red']}Tor network detected at startup! This may affect firewall functionality.{COLORS['reset']}\nPress Enter to continue...")
+    except Exception as e:
+        # Silently handle any startup errors
+        log_message(f"Tor detection error at startup: {str(e)}", "ERROR")
     
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
@@ -873,7 +877,7 @@ def show_menu():
         print("       | |                                                                ")
         print("       |_|               L I T E  E D I T I O N                          ")
         print(f"{COLORS['reset']}")
-        print(f"{COLORS['yellow']}Simple Network Security & Intrusion Detection System{COLORS['reset']}")
+        print(f"{COLORS['yellow']}Simple Network Security and Intrusion Detection System{COLORS['reset']}")
         print(f"Version 1.0.0 | Running as: {os.getlogin()}")
         print("--------------------------------------------------------")
         
