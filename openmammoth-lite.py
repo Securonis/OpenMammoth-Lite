@@ -933,7 +933,7 @@ def display_banner():
     print(f"{COLORS['reset']}")
     
     # Subtitle without special characters
-    print(f"{COLORS['yellow']}Simple Network Security and Intrusion Detection System{COLORS['reset']}")
+    print(f"{COLORS['yellow']}Network Security and Intrusion Detection System{COLORS['reset']}")
     print(f"Version 1.0.0 | Running as: {os.getlogin()}")
     print("--------------------------------------------------------")
 
@@ -1041,7 +1041,7 @@ def show_menu():
 
 if __name__ == "__main__":
     # Initialize
-    print(f"{COLORS['cyan']}[*] Starting OpenMammoth-Lite v1.0.0...{COLORS['reset']}")
+    print(f"{COLORS['cyan']}[*] Starting OpenMammoth-Lite v1.0...{COLORS['reset']}")
     
     # Check dependencies
     if not check_dependencies():
