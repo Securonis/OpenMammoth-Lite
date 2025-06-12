@@ -52,8 +52,12 @@ TIME_WINDOW = 60             # Time window for rate-based detection (seconds)
 FINSCAN_THRESHOLD = 10       # FIN scan detection
 XMAS_THRESHOLD = 8           # XMAS scan detection
 NULLSCAN_THRESHOLD = 8       # NULL scan detection
-# Use a more robust iptables command that's less likely to cause "bad rule" errors
-BLOCK_COMMAND = "iptables -A INPUT -s {} -j DROP 2>/dev/null || iptables -I INPUT -s {} -j DROP"
+
+# Local network settings
+TRUST_LOCAL_NETWORK = True   # Set to False if you want to monitor local network too
+# Use super robust iptables commands that avoid bad rule errors
+BLOCK_COMMAND = "iptables -C INPUT -s {} -j DROP 2>/dev/null || iptables -A INPUT -s {} -j DROP"
+BLOCK_COMMAND_FALLBACK = "iptables -C INPUT -s {} -j REJECT 2>/dev/null || iptables -I INPUT -s {} -j REJECT"
 IP_TIMEOUT = 300  # seconds
 BLOCKLIST_FILE = "/var/log/openmammoth_lite.blocklist"
 LOG_FILE = "/var/log/openmammoth_lite.log"
@@ -66,14 +70,44 @@ selected_interface = None  # Selected network interface
 program_start_time = time.time()  # Program start time
 
 def detect_tor_connection():
-    """Detect if Tor is running on the system"""
+    """Detect if Tor is running on the system using multiple detection methods"""
+    tor_detected = False
+    
+    # Method 1: Check using systemctl if available
     try:
-        output = subprocess.check_output(["netstat", "-tunlp"]).decode()
-        if ":9050" in output or ":9150" in output:
-            print(f"{COLORS['yellow']}[!] Tor network detected! This may conflict with iptables rules.{COLORS['reset']}")
-            return True
+        # Check if Tor service is active using systemctl
+        systemctl_output = subprocess.check_output(["systemctl", "is-active", "tor"], stderr=subprocess.STDOUT).decode().strip()
+        if systemctl_output == "active":
+            print(f"{COLORS['yellow']}[!] Tor service is active (detected via systemctl){COLORS['reset']}")
+            tor_detected = True
     except Exception:
+        # systemctl might not be available or tor service might not be registered
         pass
+        
+    # Method 2: Fallback to netstat to check Tor ports
+    if not tor_detected:
+        try:
+            output = subprocess.check_output(["netstat", "-tunlp"], stderr=subprocess.STDOUT).decode()
+            if ":9050" in output or ":9150" in output:
+                print(f"{COLORS['yellow']}[!] Tor network ports detected (9050/9150){COLORS['reset']}")
+                tor_detected = True
+        except Exception:
+            pass
+    
+    # Method 3: Check if tor process is running using ps
+    if not tor_detected:
+        try:
+            ps_output = subprocess.check_output(["ps", "aux"], stderr=subprocess.STDOUT).decode()
+            if " tor " in ps_output.lower():
+                print(f"{COLORS['yellow']}[!] Tor process detected in running processes{COLORS['reset']}")
+                tor_detected = True
+        except Exception:
+            pass
+    
+    if tor_detected:
+        print(f"{COLORS['yellow']}[!] Tor network detected! This may conflict with iptables rules.{COLORS['reset']}")
+        return True
+        
     return False
 
 
@@ -94,12 +128,51 @@ def notify_block(ip, reason):
     print(f"{COLORS['red']}[!] {message}{COLORS['reset']}")
     log_message(message, "BLOCK")
 
+def is_private_ip(ip):
+    """Check if an IP address is a private/local network address"""
+    # RFC1918 private IP ranges
+    private_ranges = [
+        ('10.0.0.0', '10.255.255.255'),     # 10.0.0.0/8
+        ('172.16.0.0', '172.31.255.255'),   # 172.16.0.0/12
+        ('192.168.0.0', '192.168.255.255')  # 192.168.0.0/16
+    ]
+    
+    # Convert IP string to integer for range comparison
+    ip_parts = ip.split('.')
+    if len(ip_parts) != 4:
+        return False
+        
+    try:
+        ip_int = (int(ip_parts[0]) << 24) + (int(ip_parts[1]) << 16) + \
+                (int(ip_parts[2]) << 8) + int(ip_parts[3])
+                
+        # Check each private IP range
+        for start_range, end_range in private_ranges:
+            start_parts = start_range.split('.')
+            start_int = (int(start_parts[0]) << 24) + (int(start_parts[1]) << 16) + \
+                       (int(start_parts[2]) << 8) + int(start_parts[3])
+                       
+            end_parts = end_range.split('.')
+            end_int = (int(end_parts[0]) << 24) + (int(end_parts[1]) << 16) + \
+                     (int(end_parts[2]) << 8) + int(end_parts[3])
+            
+            if start_int <= ip_int <= end_int:
+                return True
+    except Exception:
+        pass
+        
+    return False
+
 def detect_attack(packet):
     """Detect various network attacks from packet analysis with enhanced detection logic"""
     global blocklist
     
     # Skip packets from whitelisted IPs
     if packet.haslayer(IP) and packet[IP].src in whitelist:
+        return
+        
+    # Skip local network IPs if TRUST_LOCAL_NETWORK is enabled
+    if TRUST_LOCAL_NETWORK and packet.haslayer(IP) and is_private_ip(packet[IP].src):
         return
     
     now = time.time()
@@ -291,13 +364,18 @@ def detect_attack(packet):
             block_ip(src, f"UDP Flood Attack: {udp_flood_counts[src][0]} packets ({flood_size})")
 
 def block_ip(ip, reason):
-    """Block an IP address using iptables"""
+    """Block an IP address using iptables with improved error handling"""
     if ip in whitelist:
         log_message(f"Attempted to block whitelisted IP {ip}", "WARNING")
         return
         
     if ip in blocklist:
         return  # Already blocked
+        
+    # Never block private/local network IPs
+    if is_private_ip(ip):
+        log_message(f"Not blocking local network IP: {ip}", "INFO")
+        return
     
     try:
         # Validate IP address format before blocking
@@ -305,7 +383,8 @@ def block_ip(ip, reason):
             log_message(f"Invalid IP format, not blocking: {ip}", "WARNING")
             return
             
-        # Block the IP with iptables - using the updated command with fallback
+        # First check if the rule already exists to avoid duplicate rules
+        # Then add the rule with DROP action
         block_cmd = BLOCK_COMMAND.format(ip, ip)
         result = os.system(block_cmd)
         
@@ -315,14 +394,31 @@ def block_ip(ip, reason):
             notify_block(ip, reason)
             # Save to blocklist file
             log_block(ip, reason)
-        else:
-            log_message(f"iptables command failed for IP {ip} with exit code {result}", "ERROR")
-            # Try alternative blocking method
-            alt_result = os.system(f"iptables -I INPUT -s {ip} -j REJECT 2>/dev/null")
-            if alt_result == 0:
-                blocklist.add(ip)
-                notify_block(ip, f"{reason} (using REJECT fallback)")
-                log_block(ip, reason)
+            return
+        
+        # If first method failed, try the REJECT fallback
+        log_message(f"Primary block method failed for {ip}, trying fallback", "WARNING")
+        fallback_cmd = BLOCK_COMMAND_FALLBACK.format(ip, ip)
+        result = os.system(fallback_cmd)
+        
+        if result == 0:
+            blocklist.add(ip)
+            notify_block(ip, f"{reason} (using REJECT fallback)")
+            log_block(ip, reason)
+            return
+            
+        # If both standard methods failed, try direct command approach
+        log_message(f"Standard blocking methods failed for {ip}, trying direct command", "WARNING")
+        try:
+            # Try direct command execution instead of os.system
+            import subprocess
+            subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], 
+                           check=True, capture_output=True)
+            blocklist.add(ip)
+            notify_block(ip, reason)
+            log_block(ip, reason)
+        except subprocess.CalledProcessError as e:
+            log_message(f"All blocking attempts failed for {ip}: {e.stderr.decode()}", "ERROR")
     except Exception as e:
         log_message(f"Error blocking IP {ip}: {str(e)}", "ERROR")
 
@@ -618,6 +714,26 @@ def manage_blocklist():
             break
 
 
+def toggle_local_network_trust():
+    """Toggle whether to trust (ignore) local network traffic"""
+    global TRUST_LOCAL_NETWORK
+    
+    print(f"{COLORS['cyan']}\n===== Local Network Trust Settings ====={COLORS['reset']}")
+    print("Current setting:")
+    print(f"Trust local network IPs (ignore them in detection): {'Enabled' if TRUST_LOCAL_NETWORK else 'Disabled'}")
+    
+    choice = input("\nToggle setting? (y/n): ")
+    if choice.lower() == 'y':
+        TRUST_LOCAL_NETWORK = not TRUST_LOCAL_NETWORK
+        status = "enabled" if TRUST_LOCAL_NETWORK else "disabled"
+        print(f"{COLORS['green']}[+] Local network trust {status}. {COLORS['reset']}")
+        if TRUST_LOCAL_NETWORK:
+            print(f"{COLORS['yellow']}[*] IPs like 192.168.x.x, 10.x.x.x will be ignored in attack detection{COLORS['reset']}")
+        else:
+            print(f"{COLORS['yellow']}[*] All IPs will be monitored, including local network{COLORS['reset']}")
+    
+    input("Press Enter to continue...")
+
 def select_network_interface():
     """Allow user to select a network interface for monitoring"""
     global selected_interface
@@ -703,6 +819,7 @@ def show_menu():
         print("5. Manage Blocked IPs")
         print("6. View System Logs")
         print("7. Select Network Interface")
+        print("8. Toggle Local Network Trust")
         print("0. Exit")
         
         choice = input("\nSelect an option: ")
@@ -721,14 +838,44 @@ def show_menu():
         elif choice == "6":
             try:
                 if os.path.exists(LOG_FILE):
-                    os.system(f"less {LOG_FILE}")
+                    print(f"{COLORS['cyan']}\n===== Log File Viewer ====={COLORS['reset']}")
+                    print(f"Viewing: {LOG_FILE}\n")
+                    print(f"{COLORS['yellow']}Select viewing option:{COLORS['reset']}")
+                    print("1. View with cat (display entire file)")
+                    print("2. View with less (scrollable view)")
+                    print("3. View last 20 lines only")
+                    print("4. Search logs for a keyword")
+                    print("0. Return to main menu")
+                    
+                    log_choice = input("\nSelect option: ")
+                    
+                    if log_choice == "1":
+                        # Use cat to display the entire file
+                        os.system(f"cat {LOG_FILE}")
+                    elif log_choice == "2":
+                        # Use less for scrollable viewing
+                        os.system(f"less {LOG_FILE}")
+                    elif log_choice == "3":
+                        # Show last 20 lines
+                        os.system(f"tail -n 20 {LOG_FILE}")
+                    elif log_choice == "4":
+                        # Search logs for keyword
+                        keyword = input("Enter search term: ")
+                        os.system(f"grep -i '{keyword}' {LOG_FILE} | cat")
+                    elif log_choice == "0":
+                        continue
+                    else:
+                        print(f"{COLORS['red']}[!] Invalid option{COLORS['reset']}")
                 else:
-                    print(f"{COLORS['yellow']}[*] No log file found{COLORS['reset']}")
-                    input("\nPress Enter to continue...")
-            except Exception:
+                    print(f"{COLORS['yellow']}[*] No log file found at {LOG_FILE}{COLORS['reset']}")
+                input("\nPress Enter to continue...")
+            except Exception as e:
+                print(f"{COLORS['red']}[!] Error viewing logs: {str(e)}{COLORS['reset']}")
                 input("\nPress Enter to continue...")
         elif choice == "7":
             select_network_interface()
+        elif choice == "8":
+            toggle_local_network_trust()
         elif choice == "0":
             if monitoring_active:
                 confirm = input("Network monitoring is active. Are you sure you want to exit? (y/n): ")
