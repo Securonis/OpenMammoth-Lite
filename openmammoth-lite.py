@@ -61,6 +61,8 @@ LOG_FILE = "/var/log/openmammoth_lite.log"
 monitoring_active = False
 detection_running = False
 whitelist = set(['127.0.0.1', '192.168.1.1'])  # Default whitelist
+selected_interface = None  # Selected network interface
+program_start_time = time.time()  # Program start time
 
 def detect_tor_connection():
     """Detect if Tor is running on the system"""
@@ -376,7 +378,7 @@ def check_dependencies():
 
 def start_monitoring():
     """Start the network monitoring"""
-    global monitoring_active, detection_running
+    global monitoring_active, detection_running, selected_interface, program_start_time
     
     if detection_running:
         print(f"{COLORS['yellow']}[*] Monitoring is already running!{COLORS['reset']}")
@@ -385,6 +387,7 @@ def start_monitoring():
     print(f"{COLORS['green']}[+] Starting network monitoring...{COLORS['reset']}")
     monitoring_active = True
     detection_running = True
+    program_start_time = time.time()
     
     # Register cleanup
     atexit.register(cleanup_firewall)
@@ -395,10 +398,21 @@ def start_monitoring():
     # Set signal handlers
     signal.signal(signal.SIGINT, lambda sig, frame: stop_monitoring())
     
-    # Start packet sniffing in a new thread
-    threading.Thread(target=lambda: sniff(filter="ip", prn=detect_attack, store=0, 
-                                     stop_filter=lambda x: not monitoring_active),
-                   daemon=True).start()
+    # Start packet sniffing in a new thread with selected interface if specified
+    if selected_interface:
+        print(f"{COLORS['green']}[+] Monitoring network interface: {selected_interface}{COLORS['reset']}")
+        threading.Thread(target=lambda: sniff(iface=selected_interface, filter="ip", prn=detect_attack, store=0, 
+                                        stop_filter=lambda x: not monitoring_active),
+                     daemon=True).start()
+    else:
+        print(f"{COLORS['green']}[+] Monitoring all available interfaces{COLORS['reset']}")
+        threading.Thread(target=lambda: sniff(filter="ip", prn=detect_attack, store=0, 
+                                        stop_filter=lambda x: not monitoring_active),
+                     daemon=True).start()
+    
+    # Show confirmation message to user
+    print(f"{COLORS['cyan']}[*] Network monitoring active. Press Ctrl+C or select option 2 to stop.{COLORS['reset']}")
+    input("Press Enter to return to menu...")
     
     log_message("Network monitoring started")
 
@@ -572,6 +586,50 @@ def manage_blocklist():
             break
 
 
+def select_network_interface():
+    """Allow user to select a network interface for monitoring"""
+    global selected_interface
+    
+    print(f"{COLORS['cyan']}\n===== Network Interface Selection ====={COLORS['reset']}")
+    print("Available network interfaces:")
+    
+    interfaces = []
+    try:
+        # Get available interfaces using scapy's get_if_list
+        from scapy.arch import get_if_list
+        interfaces = get_if_list()
+        
+        # List all interfaces with numbers
+        for i, iface in enumerate(interfaces, 1):
+            print(f"{i}. {iface}")
+            
+        print(f"Current interface: {selected_interface if selected_interface else 'All (default)'}")
+        
+        # Let user select an interface
+        choice = input("\nSelect interface number (0 for all interfaces): ")
+        
+        if choice == '0':
+            selected_interface = None
+            print(f"{COLORS['green']}[+] Using all available interfaces{COLORS['reset']}")
+        elif choice.isdigit() and 1 <= int(choice) <= len(interfaces):
+            selected_interface = interfaces[int(choice)-1]
+            print(f"{COLORS['green']}[+] Selected interface: {selected_interface}{COLORS['reset']}")
+        else:
+            print(f"{COLORS['red']}[!] Invalid choice, using all interfaces{COLORS['reset']}")
+            selected_interface = None
+            
+    except Exception as e:
+        print(f"{COLORS['red']}[!] Error getting network interfaces: {str(e)}{COLORS['reset']}")
+        print(f"{COLORS['yellow']}[*] Using all available interfaces{COLORS['reset']}")
+    
+    input("Press Enter to continue...")
+
+
+def show_attack_statistics():
+    """Alias for show_stats with improved formatting"""
+    show_stats()
+    
+
 def show_menu():
     """Display the main menu interface"""
     while True:
@@ -579,11 +637,11 @@ def show_menu():
         
         # ASCII Art logo
         print(f"{COLORS['cyan']}")
-        print("  ____                   __  __                                  _   _     ")
-        print(" / __ \                 |  \/  |                                | | | |   ")
+        print("  ____                   __  __                                 _   _     ")
+        print(" / __ \                 |  \/  |                               | | | |   ")
         print("| |  | |_ __   ___ _ __ | \  / | __ _ _ __ ___  _ __ ___   ___ | |_| |__  ")
         print("| |  | | '_ \ / _ \ '_ \| |\/| |/ _` | '_ ` _ \| '_ ` _ \ / _ \| __| '_ \ ")
-        print("| |__| | |_) |  __/ | | | |  | | (_| | | | | | | | | | | | (_) | |_| | | ||")
+        print("| |__| | |_) |  __/ | | | |  | | (_| | | | | | | | | | | | (_) | |_| | | ||") 
         print(" \____/| .__/ \___|_| |_|_|  |_|\__,_|_| |_| |_|_| |_| |_|\___/ \__|_| |_|")
         print("       | |                                                                ")
         print("       |_|               L I T E  E D I T I O N                          ")
@@ -595,6 +653,8 @@ def show_menu():
         # Status info
         status = f"{COLORS['green']}ACTIVE{COLORS['reset']}" if monitoring_active else f"{COLORS['red']}INACTIVE{COLORS['reset']}"
         print(f"Monitoring Status: {status}")
+        if selected_interface:
+            print(f"Network Interface: {selected_interface}")
         print(f"Blocked IPs: {len(blocklist)}")
         print("--------------------------------------------------------")
         
@@ -605,6 +665,7 @@ def show_menu():
         print("4. Manage IP Whitelist")
         print("5. Manage Blocked IPs")
         print("6. View System Logs")
+        print("7. Select Network Interface")
         print("0. Exit")
         
         choice = input("\nSelect an option: ")
@@ -614,7 +675,7 @@ def show_menu():
         elif choice == "2":
             stop_monitoring()
         elif choice == "3":
-            show_stats()
+            show_attack_statistics()
             input("\nPress Enter to continue...")
         elif choice == "4":
             manage_whitelist()
@@ -629,6 +690,8 @@ def show_menu():
                     input("\nPress Enter to continue...")
             except Exception:
                 input("\nPress Enter to continue...")
+        elif choice == "7":
+            select_network_interface()
         elif choice == "0":
             if monitoring_active:
                 confirm = input("Network monitoring is active. Are you sure you want to exit? (y/n): ")
