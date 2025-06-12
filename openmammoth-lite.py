@@ -934,7 +934,7 @@ def display_banner():
     
     # Subtitle without special characters
     print(f"{COLORS['yellow']}Network Security and Intrusion Detection System{COLORS['reset']}")
-    print(f"Version 1.0.0 | Running as: {os.getlogin()}")
+    print(f"Version 1.0 | Running as: {os.getlogin()}")
     print("--------------------------------------------------------")
 
 
