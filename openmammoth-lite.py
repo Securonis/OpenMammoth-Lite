@@ -52,7 +52,8 @@ TIME_WINDOW = 60             # Time window for rate-based detection (seconds)
 FINSCAN_THRESHOLD = 10       # FIN scan detection
 XMAS_THRESHOLD = 8           # XMAS scan detection
 NULLSCAN_THRESHOLD = 8       # NULL scan detection
-BLOCK_COMMAND = "iptables -I INPUT -s {} -j DROP"
+# Use a more robust iptables command that's less likely to cause "bad rule" errors
+BLOCK_COMMAND = "iptables -A INPUT -s {} -j DROP 2>/dev/null || iptables -I INPUT -s {} -j DROP"
 IP_TIMEOUT = 300  # seconds
 BLOCKLIST_FILE = "/var/log/openmammoth_lite.blocklist"
 LOG_FILE = "/var/log/openmammoth_lite.log"
@@ -114,7 +115,7 @@ def detect_attack(packet):
         if src in blocklist:
             return
             
-        # Enhanced SYN Flood detection (rate-based)
+        # Enhanced SYN Flood detection (rate-based) - Fix to properly distinguish from port scans
         if flags == 'S':
             # Record packet timestamp for rate analysis
             if len(syn_counts[src][2]) > 20:  # Keep only last 20 timestamps
@@ -124,15 +125,28 @@ def detect_attack(packet):
             syn_counts[src][0] += 1
             syn_counts[src][1] = now
             
-            # Detect rapid SYN bursts
-            if len(syn_counts[src][2]) > 10:  # Need at least 10 samples
-                rate = len(syn_counts[src][2]) / (syn_counts[src][2][-1] - syn_counts[src][2][0])
-                if rate > 5:  # More than 5 SYNs per second is suspicious
-                    log_message(f"High-rate SYN from {src}: {rate:.2f}/sec", "WARNING")
+            # Detect rapid SYN bursts - More aggressive detection for SYN floods
+            if len(syn_counts[src][2]) >= 5:  # Need at least 5 samples
+                time_window = max(0.1, syn_counts[src][2][-1] - syn_counts[src][2][0])  # Avoid division by zero
+                rate = len(syn_counts[src][2]) / time_window
+                
+                # Check if this is likely a SYN flood rather than port scan
+                # SYN floods typically target the same port repeatedly
+                is_flood = False
+                if len(connection_attempts[src][0]) < 5:  # Few unique ports = likely flood not scan
+                    is_flood = True
                     
+                # High rate of SYNs to one or few ports = SYN flood
+                if rate > 10:  # More than 10 SYNs per second is suspicious
+                    log_message(f"High-rate SYN from {src}: {rate:.2f}/sec to {len(connection_attempts[src][0])} ports", "WARNING")
+                    if is_flood and syn_counts[src][0] > BLOCK_THRESHOLD/2:  # Lower threshold for confirmed floods
+                        block_ip(src, f"SYN Flood Attack: {syn_counts[src][0]} SYNs at {rate:.1f}/sec")
+                        return  # Prevent port scan detection for SYN floods
+                        
             # Standard volume-based detection
             if syn_counts[src][0] > BLOCK_THRESHOLD:
                 block_ip(src, f"SYN Flood Attack: {syn_counts[src][0]} attempts")
+                return  # Prevent port scan detection for SYN floods
 
         # Advanced Port Scan detection
         connection_attempts[src][0].add(dst_port)
@@ -286,15 +300,29 @@ def block_ip(ip, reason):
         return  # Already blocked
     
     try:
-        # Block the IP with iptables
-        os.system(BLOCK_COMMAND.format(ip))
-        blocklist.add(ip)
+        # Validate IP address format before blocking
+        if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+            log_message(f"Invalid IP format, not blocking: {ip}", "WARNING")
+            return
+            
+        # Block the IP with iptables - using the updated command with fallback
+        block_cmd = BLOCK_COMMAND.format(ip, ip)
+        result = os.system(block_cmd)
         
-        # Log the block
-        notify_block(ip, reason)
-        
-        # Save to blocklist file
-        log_block(ip, reason)
+        if result == 0:
+            blocklist.add(ip)
+            # Log the block
+            notify_block(ip, reason)
+            # Save to blocklist file
+            log_block(ip, reason)
+        else:
+            log_message(f"iptables command failed for IP {ip} with exit code {result}", "ERROR")
+            # Try alternative blocking method
+            alt_result = os.system(f"iptables -I INPUT -s {ip} -j REJECT 2>/dev/null")
+            if alt_result == 0:
+                blocklist.add(ip)
+                notify_block(ip, f"{reason} (using REJECT fallback)")
+                log_block(ip, reason)
     except Exception as e:
         log_message(f"Error blocking IP {ip}: {str(e)}", "ERROR")
 
@@ -383,6 +411,16 @@ def start_monitoring():
     if detection_running:
         print(f"{COLORS['yellow']}[*] Monitoring is already running!{COLORS['reset']}")
         return
+        
+    # Force interface selection before monitoring starts
+    if not selected_interface:
+        print(f"{COLORS['yellow']}[!] You must select a network interface before starting monitoring.{COLORS['reset']}")
+        select_network_interface()
+        # If user didn't select an interface, abort monitoring
+        if not selected_interface:
+            print(f"{COLORS['red']}[!] Monitoring aborted - No interface selected{COLORS['reset']}")
+            input("Press Enter to return to menu...")
+            return
     
     print(f"{COLORS['green']}[+] Starting network monitoring...{COLORS['reset']}")
     monitoring_active = True
@@ -398,23 +436,17 @@ def start_monitoring():
     # Set signal handlers
     signal.signal(signal.SIGINT, lambda sig, frame: stop_monitoring())
     
-    # Start packet sniffing in a new thread with selected interface if specified
-    if selected_interface:
-        print(f"{COLORS['green']}[+] Monitoring network interface: {selected_interface}{COLORS['reset']}")
-        threading.Thread(target=lambda: sniff(iface=selected_interface, filter="ip", prn=detect_attack, store=0, 
-                                        stop_filter=lambda x: not monitoring_active),
-                     daemon=True).start()
-    else:
-        print(f"{COLORS['green']}[+] Monitoring all available interfaces{COLORS['reset']}")
-        threading.Thread(target=lambda: sniff(filter="ip", prn=detect_attack, store=0, 
-                                        stop_filter=lambda x: not monitoring_active),
-                     daemon=True).start()
+    # Start packet sniffing in a new thread with selected interface
+    print(f"{COLORS['green']}[+] Monitoring network interface: {selected_interface}{COLORS['reset']}")
+    threading.Thread(target=lambda: sniff(iface=selected_interface, filter="ip", prn=detect_attack, store=0, 
+                                    stop_filter=lambda x: not monitoring_active),
+                   daemon=True).start()
     
     # Show confirmation message to user
     print(f"{COLORS['cyan']}[*] Network monitoring active. Press Ctrl+C or select option 2 to stop.{COLORS['reset']}")
     input("Press Enter to return to menu...")
     
-    log_message("Network monitoring started")
+    log_message("Network monitoring started on interface: " + selected_interface)
 
 
 def stop_monitoring():
@@ -599,28 +631,33 @@ def select_network_interface():
         from scapy.arch import get_if_list
         interfaces = get_if_list()
         
+        if not interfaces:
+            print(f"{COLORS['red']}[!] No network interfaces detected. This may be a permissions issue.{COLORS['reset']}")
+            print(f"{COLORS['yellow']}[*] Try running the program with administrator/root privileges.{COLORS['reset']}")
+            selected_interface = None
+            input("Press Enter to continue...")
+            return
+        
         # List all interfaces with numbers
         for i, iface in enumerate(interfaces, 1):
             print(f"{i}. {iface}")
             
-        print(f"Current interface: {selected_interface if selected_interface else 'All (default)'}")
+        print(f"Current interface: {selected_interface if selected_interface else 'None selected'}")
         
         # Let user select an interface
-        choice = input("\nSelect interface number (0 for all interfaces): ")
-        
-        if choice == '0':
-            selected_interface = None
-            print(f"{COLORS['green']}[+] Using all available interfaces{COLORS['reset']}")
-        elif choice.isdigit() and 1 <= int(choice) <= len(interfaces):
-            selected_interface = interfaces[int(choice)-1]
-            print(f"{COLORS['green']}[+] Selected interface: {selected_interface}{COLORS['reset']}")
-        else:
-            print(f"{COLORS['red']}[!] Invalid choice, using all interfaces{COLORS['reset']}")
-            selected_interface = None
+        while True:  # Keep asking until valid selection
+            choice = input("\nSelect interface number: ")
+            
+            if choice.isdigit() and 1 <= int(choice) <= len(interfaces):
+                selected_interface = interfaces[int(choice)-1]
+                print(f"{COLORS['green']}[+] Selected interface: {selected_interface}{COLORS['reset']}")
+                break
+            else:
+                print(f"{COLORS['red']}[!] Invalid choice. Please select a valid interface number.{COLORS['reset']}")
             
     except Exception as e:
         print(f"{COLORS['red']}[!] Error getting network interfaces: {str(e)}{COLORS['reset']}")
-        print(f"{COLORS['yellow']}[*] Using all available interfaces{COLORS['reset']}")
+        print(f"{COLORS['yellow']}[*] Cannot proceed without selecting an interface{COLORS['reset']}")
     
     input("Press Enter to continue...")
 
@@ -641,7 +678,7 @@ def show_menu():
         print(" / __ \                 |  \/  |                               | | | |   ")
         print("| |  | |_ __   ___ _ __ | \  / | __ _ _ __ ___  _ __ ___   ___ | |_| |__  ")
         print("| |  | | '_ \ / _ \ '_ \| |\/| |/ _` | '_ ` _ \| '_ ` _ \ / _ \| __| '_ \ ")
-        print("| |__| | |_) |  __/ | | | |  | | (_| | | | | | | | | | | | (_) | |_| | | ||") 
+        print("| |__| | |_) |  __/ | | | |  | | (_| | | | | | | | | | | | (_) | |_| | | |") 
         print(" \____/| .__/ \___|_| |_|_|  |_|\__,_|_| |_| |_|_| |_| |_|\___/ \__|_| |_|")
         print("       | |                                                                ")
         print("       |_|               L I T E  E D I T I O N                          ")
