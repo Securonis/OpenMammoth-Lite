@@ -52,8 +52,15 @@ TIME_WINDOW = 60             # Time window for rate-based detection (seconds)
 FINSCAN_THRESHOLD = 10       # FIN scan detection
 XMAS_THRESHOLD = 8           # XMAS scan detection
 NULLSCAN_THRESHOLD = 8       # NULL scan detection
-# Use a more robust iptables command that's less likely to cause "bad rule" errors
-BLOCK_COMMAND = "iptables -A INPUT -s {} -j DROP 2>/dev/null || iptables -I INPUT -s {} -j DROP"
+
+# Local network settings
+TRUST_LOCAL_NETWORK = True   # Set to False if you want to monitor local network too
+# Use super robust iptables commands that avoid bad rule errors
+BLOCK_COMMAND = "iptables -C INPUT -s {} -j DROP 2>/dev/null || iptables -A INPUT -s {} -j DROP 2>/dev/null"
+BLOCK_COMMAND_FALLBACK = "iptables -C INPUT -s {} -j REJECT 2>/dev/null || iptables -I INPUT -s {} -j REJECT 2>/dev/null"
+# Direct command versions for subprocess use
+DIRECT_DROP_COMMAND = ["iptables", "-A", "INPUT", "-s", "{}", "-j", "DROP"]
+DIRECT_REJECT_COMMAND = ["iptables", "-I", "INPUT", "-s", "{}", "-j", "REJECT"]
 IP_TIMEOUT = 300  # seconds
 BLOCKLIST_FILE = "/var/log/openmammoth_lite.blocklist"
 LOG_FILE = "/var/log/openmammoth_lite.log"
@@ -66,14 +73,78 @@ selected_interface = None  # Selected network interface
 program_start_time = time.time()  # Program start time
 
 def detect_tor_connection():
-    """Detect if Tor is running on the system"""
+    """Detect if Tor is running on the system using multiple detection methods"""
+    tor_detected = False
+    detection_messages = []
+    
+    # Method 1: Check using systemctl if available (most reliable)
     try:
-        output = subprocess.check_output(["netstat", "-tunlp"]).decode()
-        if ":9050" in output or ":9150" in output:
-            print(f"{COLORS['yellow']}[!] Tor network detected! This may conflict with iptables rules.{COLORS['reset']}")
-            return True
+        # Check for tor.service
+        systemctl_output = subprocess.run(["systemctl", "is-active", "tor.service"], 
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+        if systemctl_output.stdout.strip() == "active":
+            detection_messages.append(f"{COLORS['yellow']}[!] Tor service is active (systemctl reports tor.service running){COLORS['reset']}")
+            tor_detected = True
     except Exception:
         pass
+        
+    # Try again with just "tor" instead of "tor.service"
+    if not tor_detected:
+        try:
+            systemctl_output = subprocess.run(["systemctl", "is-active", "tor"], 
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+            if systemctl_output.stdout.strip() == "active":
+                detection_messages.append(f"{COLORS['yellow']}[!] Tor service is active (systemctl reports tor running){COLORS['reset']}")
+                tor_detected = True
+        except Exception:
+            pass
+        
+    # Method 2: Check running processes for 'tor' using 'ps'
+    if not tor_detected:
+        try:
+            ps_output = subprocess.run(["ps", "aux"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+            output_text = ps_output.stdout.lower()
+            if "tor " in output_text or "/tor" in output_text:
+                detection_messages.append(f"{COLORS['yellow']}[!] Tor process found in running processes{COLORS['reset']}")
+                tor_detected = True
+        except Exception:
+            pass
+            
+    # Method 3: Check for open Tor ports using netstat
+    # Tor default ports: 9050 (SOCKS), 9051 (Control), 9150 (Browser Bundle)
+    if not tor_detected:
+        try:
+            netstat_output = subprocess.run(["netstat", "-tunlp"], 
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+            output_text = netstat_output.stdout
+            if ":9050" in output_text or ":9051" in output_text or ":9150" in output_text:
+                detection_messages.append(f"{COLORS['yellow']}[!] Tor network ports detected (9050/9051/9150){COLORS['reset']}")
+                tor_detected = True
+        except Exception:
+            pass
+    
+    # Method 4: Check if we can connect to the Tor SOCKS port
+    if not tor_detected:
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            result = s.connect_ex(('127.0.0.1', 9050))
+            s.close()
+            if result == 0:
+                detection_messages.append(f"{COLORS['yellow']}[!] Tor SOCKS port 9050 is open and accepting connections{COLORS['reset']}")
+                tor_detected = True
+        except Exception:
+            pass
+    
+    # Print all detection messages
+    for message in detection_messages:
+        print(message)
+        
+    if tor_detected:
+        print(f"{COLORS['yellow']}[!] TOR NETWORK DETECTED! This may conflict with iptables rules.{COLORS['reset']}")
+        return True
+        
     return False
 
 
@@ -94,12 +165,51 @@ def notify_block(ip, reason):
     print(f"{COLORS['red']}[!] {message}{COLORS['reset']}")
     log_message(message, "BLOCK")
 
+def is_private_ip(ip):
+    """Check if an IP address is a private/local network address"""
+    # RFC1918 private IP ranges
+    private_ranges = [
+        ('10.0.0.0', '10.255.255.255'),     # 10.0.0.0/8
+        ('172.16.0.0', '172.31.255.255'),   # 172.16.0.0/12
+        ('192.168.0.0', '192.168.255.255')  # 192.168.0.0/16
+    ]
+    
+    # Convert IP string to integer for range comparison
+    ip_parts = ip.split('.')
+    if len(ip_parts) != 4:
+        return False
+        
+    try:
+        ip_int = (int(ip_parts[0]) << 24) + (int(ip_parts[1]) << 16) + \
+                (int(ip_parts[2]) << 8) + int(ip_parts[3])
+                
+        # Check each private IP range
+        for start_range, end_range in private_ranges:
+            start_parts = start_range.split('.')
+            start_int = (int(start_parts[0]) << 24) + (int(start_parts[1]) << 16) + \
+                       (int(start_parts[2]) << 8) + int(start_parts[3])
+                       
+            end_parts = end_range.split('.')
+            end_int = (int(end_parts[0]) << 24) + (int(end_parts[1]) << 16) + \
+                     (int(end_parts[2]) << 8) + int(end_parts[3])
+            
+            if start_int <= ip_int <= end_int:
+                return True
+    except Exception:
+        pass
+        
+    return False
+
 def detect_attack(packet):
     """Detect various network attacks from packet analysis with enhanced detection logic"""
     global blocklist
     
     # Skip packets from whitelisted IPs
     if packet.haslayer(IP) and packet[IP].src in whitelist:
+        return
+        
+    # Skip local network IPs ONLY if TRUST_LOCAL_NETWORK is enabled
+    if packet.haslayer(IP) and is_private_ip(packet[IP].src) and TRUST_LOCAL_NETWORK:
         return
     
     now = time.time()
@@ -291,40 +401,122 @@ def detect_attack(packet):
             block_ip(src, f"UDP Flood Attack: {udp_flood_counts[src][0]} packets ({flood_size})")
 
 def block_ip(ip, reason):
-    """Block an IP address using iptables"""
+    """Block an IP address using iptables with maximum reliability"""
     if ip in whitelist:
         log_message(f"Attempted to block whitelisted IP {ip}", "WARNING")
         return
         
     if ip in blocklist:
         return  # Already blocked
+        
+    # Only skip blocking private IPs if TRUST_LOCAL_NETWORK is enabled
+    if is_private_ip(ip) and TRUST_LOCAL_NETWORK:
+        log_message(f"Not blocking local network IP: {ip} (Local Network Trust is enabled)", "INFO")
+        return
+    elif is_private_ip(ip) and not TRUST_LOCAL_NETWORK:
+        log_message(f"Blocking local network IP: {ip} (Local Network Trust is disabled)", "WARNING")
+    
+    blocking_success = False
     
     try:
         # Validate IP address format before blocking
         if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
             log_message(f"Invalid IP format, not blocking: {ip}", "WARNING")
             return
-            
-        # Block the IP with iptables - using the updated command with fallback
-        block_cmd = BLOCK_COMMAND.format(ip, ip)
-        result = os.system(block_cmd)
         
-        if result == 0:
+        # APPROACH 1: Try using subprocess directly with DROP action (most reliable)
+        try:
+            # First check if rule already exists to avoid duplicates
+            check_cmd = ["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"]
+            check_result = subprocess.run(check_cmd, 
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+            
+            # Rule doesn't exist, add it
+            if check_result.returncode != 0:
+                add_cmd = ["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"]
+                subprocess.run(add_cmd, check=True, 
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+            
+            # Success either way
+            blocking_success = True
+        except Exception as e1:
+            log_message(f"First blocking method failed for {ip}: {str(e1)}", "WARNING")
+            
+        # APPROACH 2: Try shell command with redirection if first approach failed
+        if not blocking_success:
+            try:
+                block_cmd = BLOCK_COMMAND.format(ip, ip)
+                os.system(block_cmd)
+                # Check if rule got added successfully
+                check_cmd = ["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"]
+                check_result = subprocess.run(check_cmd, 
+                                            stdout=subprocess.DEVNULL, 
+                                            stderr=subprocess.DEVNULL)
+                if check_result.returncode == 0:
+                    blocking_success = True
+            except Exception as e2:
+                log_message(f"Second blocking method failed for {ip}: {str(e2)}", "WARNING")
+                
+        # APPROACH 3: Try REJECT action as last resort
+        if not blocking_success:
+            try:
+                # Try adding rule with REJECT instead of DROP
+                check_cmd = ["iptables", "-C", "INPUT", "-s", ip, "-j", "REJECT"]
+                check_result = subprocess.run(check_cmd, 
+                                            stdout=subprocess.DEVNULL, 
+                                            stderr=subprocess.DEVNULL)
+                
+                # Rule doesn't exist, add it
+                if check_result.returncode != 0:
+                    add_cmd = ["iptables", "-I", "INPUT", "-s", ip, "-j", "REJECT"]
+                    subprocess.run(add_cmd, check=True, 
+                                 stdout=subprocess.DEVNULL, 
+                                 stderr=subprocess.DEVNULL)
+                
+                # Success either way
+                blocking_success = True
+            except Exception as e3:
+                log_message(f"All blocking methods failed for {ip}: {str(e3)}", "ERROR")
+        
+        # APPROACH 4: If all else failed, try using iptables-save/restore
+        if not blocking_success:
+            try:
+                # Save current rules
+                temp_rules = "/tmp/iptables_rules_temp"
+                os.system(f"iptables-save > {temp_rules}")
+                
+                # Append our rule and restore
+                with open(temp_rules, "a") as f:
+                    f.write(f"-A INPUT -s {ip} -j DROP\n")
+                    
+                os.system(f"iptables-restore < {temp_rules}")
+                os.remove(temp_rules)
+                
+                # Verify it worked
+                check_cmd = ["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"]
+                check_result = subprocess.run(check_cmd, 
+                                           stdout=subprocess.DEVNULL, 
+                                           stderr=subprocess.DEVNULL)
+                if check_result.returncode == 0:
+                    blocking_success = True
+            except Exception as e4:
+                log_message(f"Emergency blocking method failed for {ip}: {str(e4)}", "ERROR")
+                
+        # If any method succeeded, update the state
+        if blocking_success:
             blocklist.add(ip)
-            # Log the block
             notify_block(ip, reason)
-            # Save to blocklist file
             log_block(ip, reason)
+            return True
         else:
-            log_message(f"iptables command failed for IP {ip} with exit code {result}", "ERROR")
-            # Try alternative blocking method
-            alt_result = os.system(f"iptables -I INPUT -s {ip} -j REJECT 2>/dev/null")
-            if alt_result == 0:
-                blocklist.add(ip)
-                notify_block(ip, f"{reason} (using REJECT fallback)")
-                log_block(ip, reason)
+            log_message(f"All blocking attempts failed for {ip}", "ERROR")
+            return False
+                
     except Exception as e:
-        log_message(f"Error blocking IP {ip}: {str(e)}", "ERROR")
+        log_message(f"Error in IP blocking logic: {str(e)}", "ERROR")
+        return False
 
 
 def log_block(ip, reason):
@@ -405,56 +597,87 @@ def check_dependencies():
 
 
 def start_monitoring():
-    """Start the network monitoring"""
-    global monitoring_active, detection_running, selected_interface, program_start_time
+    """Start network monitoring"""
+    global monitoring_active, sniff_thread
     
-    if detection_running:
-        print(f"{COLORS['yellow']}[*] Monitoring is already running!{COLORS['reset']}")
-        return
-        
-    # Force interface selection before monitoring starts
+    # Force interface selection before monitoring
     if not selected_interface:
-        print(f"{COLORS['yellow']}[!] You must select a network interface before starting monitoring.{COLORS['reset']}")
+        print(f"{COLORS['yellow']}[!] You need to select a network interface before monitoring.{COLORS['reset']}")
+        input("Press Enter to select an interface...")
         select_network_interface()
-        # If user didn't select an interface, abort monitoring
-        if not selected_interface:
-            print(f"{COLORS['red']}[!] Monitoring aborted - No interface selected{COLORS['reset']}")
-            input("Press Enter to return to menu...")
+        if not selected_interface:  # User cancelled interface selection
             return
     
-    print(f"{COLORS['green']}[+] Starting network monitoring...{COLORS['reset']}")
-    monitoring_active = True
-    detection_running = True
-    program_start_time = time.time()
-    
-    # Register cleanup
-    atexit.register(cleanup_firewall)
-    
-    # Start cleanup thread
-    threading.Thread(target=cleanup, daemon=True).start()
-    
-    # Set signal handlers
-    signal.signal(signal.SIGINT, lambda sig, frame: stop_monitoring())
-    
-    # Start packet sniffing in a new thread with selected interface
-    print(f"{COLORS['green']}[+] Monitoring network interface: {selected_interface}{COLORS['reset']}")
-    threading.Thread(target=lambda: sniff(iface=selected_interface, filter="ip", prn=detect_attack, store=0, 
-                                    stop_filter=lambda x: not monitoring_active),
-                   daemon=True).start()
-    
-    # Show confirmation message to user
-    print(f"{COLORS['cyan']}[*] Network monitoring active. Press Ctrl+C or select option 2 to stop.{COLORS['reset']}")
-    input("Press Enter to return to menu...")
-    
-    log_message("Network monitoring started on interface: " + selected_interface)
+    if not monitoring_active:
+        # Initial attack checks - Run with foreground detection
+        print(f"{COLORS['cyan']}[*] Performing initial security checks...{COLORS['reset']}")
+        is_tor_running = detect_tor_connection()
+        if is_tor_running:
+            print(f"{COLORS['red']}[!] IMPORTANT: Tor network detected! Some firewall rules may not work correctly.{COLORS['reset']}")
+            proceed = input("Do you want to continue anyway? (y/n): ")
+            if proceed.lower() != 'y':
+                print(f"{COLORS['yellow']}[*] Monitoring cancelled.{COLORS['reset']}")
+                input("Press Enter to continue...")
+                return
+                
+        if not TRUST_LOCAL_NETWORK:
+            print(f"{COLORS['yellow']}[!] WARNING: Local Network Trust is disabled. Your local network devices may be blocked!{COLORS['reset']}")
+            proceed = input("Do you want to continue anyway? (y/n): ")
+            if proceed.lower() != 'y':
+                print(f"{COLORS['yellow']}[*] Monitoring cancelled.{COLORS['reset']}")
+                input("Press Enter to continue...")
+                return
+        
+        monitoring_active = True
+        print(f"{COLORS['green']}[+] Starting network monitoring on {selected_interface}...{COLORS['reset']}")
+        
+        # Start packet sniffing in a separate thread
+        sniff_thread = threading.Thread(target=start_sniffing)
+        sniff_thread.daemon = True
+        sniff_thread.start()
+        
+        print(f"{COLORS['green']}[+] Monitoring started. Press Ctrl+C to return to menu.{COLORS['reset']}")
+        input("Press Enter to return to menu...")
+    else:
+        print(f"{COLORS['yellow']}[!] Monitoring is already active{COLORS['reset']}")
+        input("Press Enter to continue...")
+
+
+def start_sniffing():
+    """Start packet sniffing using Scapy"""
+    global monitoring_active, selected_interface
+    try:
+        # Log the start of sniffing
+        log_message(f"Starting packet sniffing on interface: {selected_interface}")
+        
+        # Start sniffing packets on the selected interface
+        # The sniff function will continue until monitoring_active becomes False
+        sniff(iface=selected_interface, 
+              filter="ip", 
+              prn=detect_attack, 
+              store=0,
+              stop_filter=lambda x: not monitoring_active)
+              
+    except Exception as e:
+        log_message(f"Error in packet sniffing: {str(e)}", "ERROR")
+        print(f"{COLORS['red']}[!] Sniffing error: {str(e)}{COLORS['reset']}")
+        monitoring_active = False
 
 
 def stop_monitoring():
-    """Stop the network monitoring"""
-    global monitoring_active
-    monitoring_active = False
-    print(f"{COLORS['yellow']}[*] Stopping network monitoring...{COLORS['reset']}")
-    log_message("Network monitoring stopped")
+    """Stop network monitoring"""
+    global monitoring_active, detection_running
+    
+    if monitoring_active:
+        print(f"{COLORS['yellow']}[*] Stopping network monitoring...{COLORS['reset']}")
+        monitoring_active = False
+        detection_running = False
+        log_message("Network monitoring stopped")
+        print(f"{COLORS['green']}[+] Monitoring stopped{COLORS['reset']}")
+        input("Press Enter to continue...")
+    else:
+        print(f"{COLORS['yellow']}[*] Monitoring is not active{COLORS['reset']}")
+        input("Press Enter to continue...")
 
 
 def show_stats():
@@ -618,6 +841,29 @@ def manage_blocklist():
             break
 
 
+def toggle_local_network_trust():
+    """Toggle whether to trust (ignore) local network traffic"""
+    global TRUST_LOCAL_NETWORK
+    
+    print(f"{COLORS['cyan']}\n===== Local Network Trust Settings ====={COLORS['reset']}")
+    print("Current setting:")
+    current_status = "Enabled" if TRUST_LOCAL_NETWORK else "Disabled"
+    print(f"Trust local network IPs (ignore them in detection): {current_status}")
+    
+    choice = input("\nToggle setting? (y/n): ")
+    if choice.lower() == 'y':
+        TRUST_LOCAL_NETWORK = not TRUST_LOCAL_NETWORK
+        new_status = "enabled" if TRUST_LOCAL_NETWORK else "disabled"
+        print(f"{COLORS['green']}[+] Local network trust {new_status}. {COLORS['reset']}")
+        if TRUST_LOCAL_NETWORK:
+            print(f"{COLORS['yellow']}[*] IPs like 192.168.x.x, 10.x.x.x will be ignored in attack detection{COLORS['reset']}")
+        else:
+            print(f"{COLORS['red']}[*] All IPs will be monitored, including local network{COLORS['reset']}")
+            print(f"{COLORS['red']}[*] WARNING: This may result in blocking your own devices!{COLORS['reset']}")
+    
+    input("Press Enter to continue...")
+
+
 def select_network_interface():
     """Allow user to select a network interface for monitoring"""
     global selected_interface
@@ -667,25 +913,46 @@ def show_attack_statistics():
     show_stats()
     
 
+def display_banner():
+    """Display ASCII art banner without syntax issues"""
+    banner_lines = [
+        "  ____                   __  __                                 _   _     ",
+        " / __ \\                 |  \\/  |                               | | | |   ",
+        "| |  | |_ __   ___ _ __ | \\  / | __ _ _ __ ___  _ __ ___   ___ | |_| |__  ",
+        "| |  | | '_ \\ / _ \\ '_ \\| |\\/| |/ _` | '_ ` _ \\| '_ ` _ \\ / _ \\| __| '_ \\ ",
+        "| |__| | |_) |  __/ | | | |  | | (_| | | | | | | | | | | | (_) | |_| | | |",
+        " \\____/| .__/ \\___|_| |_|_|  |_|\\__,_|_| |_| |_|_| |_| |_|\\___/ \\__|_| |_|",
+        "       | |                                                                ",
+        "       |_|               L I T E  E D I T I O N                          "
+    ]
+    
+    # Safe printing of banner
+    print(f"{COLORS['cyan']}")
+    for line in banner_lines:
+        print(line)
+    print(f"{COLORS['reset']}")
+    
+    # Subtitle without special characters
+    print(f"{COLORS['yellow']}Simple Network Security and Intrusion Detection System{COLORS['reset']}")
+    print(f"Version 1.0.0 | Running as: {os.getlogin()}")
+    print("--------------------------------------------------------")
+
+
 def show_menu():
-    """Display the main menu interface"""
+    """Show the main menu interface"""
+    try:
+        # Run Tor detection at startup
+        if detect_tor_connection():
+            input(f"{COLORS['red']}Tor network detected at startup! This may affect firewall functionality.{COLORS['reset']}\nPress Enter to continue...")
+    except Exception as e:
+        # Silently handle any startup errors
+        log_message(f"Tor detection error at startup: {str(e)}", "ERROR")
+    
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         
-        # ASCII Art logo
-        print(f"{COLORS['cyan']}")
-        print("  ____                   __  __                                 _   _     ")
-        print(" / __ \                 |  \/  |                               | | | |   ")
-        print("| |  | |_ __   ___ _ __ | \  / | __ _ _ __ ___  _ __ ___   ___ | |_| |__  ")
-        print("| |  | | '_ \ / _ \ '_ \| |\/| |/ _` | '_ ` _ \| '_ ` _ \ / _ \| __| '_ \ ")
-        print("| |__| | |_) |  __/ | | | |  | | (_| | | | | | | | | | | | (_) | |_| | | |") 
-        print(" \____/| .__/ \___|_| |_|_|  |_|\__,_|_| |_| |_|_| |_| |_|\___/ \__|_| |_|")
-        print("       | |                                                                ")
-        print("       |_|               L I T E  E D I T I O N                          ")
-        print(f"{COLORS['reset']}")
-        print(f"{COLORS['yellow']}Simple Network Security & Intrusion Detection System{COLORS['reset']}")
-        print(f"Version 1.0.0 | Running as: {os.getlogin()}")
-        print("--------------------------------------------------------")
+        # Display banner using the separate function
+        display_banner()
         
         # Status info
         status = f"{COLORS['green']}ACTIVE{COLORS['reset']}" if monitoring_active else f"{COLORS['red']}INACTIVE{COLORS['reset']}"
@@ -703,6 +970,7 @@ def show_menu():
         print("5. Manage Blocked IPs")
         print("6. View System Logs")
         print("7. Select Network Interface")
+        print("8. Toggle Local Network Trust")
         print("0. Exit")
         
         choice = input("\nSelect an option: ")
@@ -721,14 +989,44 @@ def show_menu():
         elif choice == "6":
             try:
                 if os.path.exists(LOG_FILE):
-                    os.system(f"less {LOG_FILE}")
+                    print(f"{COLORS['cyan']}\n===== Log File Viewer ====={COLORS['reset']}")
+                    print(f"Viewing: {LOG_FILE}\n")
+                    print(f"{COLORS['yellow']}Select viewing option:{COLORS['reset']}")
+                    print("1. View with cat (display entire file)")
+                    print("2. View with less (scrollable view)")
+                    print("3. View last 20 lines only")
+                    print("4. Search logs for a keyword")
+                    print("0. Return to main menu")
+                    
+                    log_choice = input("\nSelect option: ")
+                    
+                    if log_choice == "1":
+                        # Use cat to display the entire file
+                        os.system(f"cat {LOG_FILE}")
+                    elif log_choice == "2":
+                        # Use less for scrollable viewing
+                        os.system(f"less {LOG_FILE}")
+                    elif log_choice == "3":
+                        # Show last 20 lines
+                        os.system(f"tail -n 20 {LOG_FILE}")
+                    elif log_choice == "4":
+                        # Search logs for keyword
+                        keyword = input("Enter search term: ")
+                        os.system(f"grep -i '{keyword}' {LOG_FILE} | cat")
+                    elif log_choice == "0":
+                        continue
+                    else:
+                        print(f"{COLORS['red']}[!] Invalid option{COLORS['reset']}")
                 else:
-                    print(f"{COLORS['yellow']}[*] No log file found{COLORS['reset']}")
-                    input("\nPress Enter to continue...")
-            except Exception:
+                    print(f"{COLORS['yellow']}[*] No log file found at {LOG_FILE}{COLORS['reset']}")
+                input("\nPress Enter to continue...")
+            except Exception as e:
+                print(f"{COLORS['red']}[!] Error viewing logs: {str(e)}{COLORS['reset']}")
                 input("\nPress Enter to continue...")
         elif choice == "7":
             select_network_interface()
+        elif choice == "8":
+            toggle_local_network_trust()
         elif choice == "0":
             if monitoring_active:
                 confirm = input("Network monitoring is active. Are you sure you want to exit? (y/n): ")
