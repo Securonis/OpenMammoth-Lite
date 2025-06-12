@@ -23,12 +23,18 @@ COLORS = {
 }
 
 # Attack detection counters and settings
-syn_counts = defaultdict(lambda: [0, time.time()])
-connection_attempts = defaultdict(lambda: [set(), time.time()])
+syn_counts = defaultdict(lambda: [0, time.time(), []])
+connection_attempts = defaultdict(lambda: [set(), time.time(), {}])
 icmp_flood_counts = defaultdict(lambda: [0, time.time()])
-udp_flood_counts = defaultdict(lambda: [0, time.time()])
-http_flood_counts = defaultdict(lambda: [0, time.time()])
+udp_flood_counts = defaultdict(lambda: [0, time.time(), 0])  # [count, last_time, total_bytes]
+http_flood_counts = defaultdict(lambda: [0, time.time(), set()])  # [count, last_time, user_agents]
 authentication_failures = defaultdict(lambda: [0, time.time()])
+
+# Advanced attack detection counters
+dns_amp_counts = defaultdict(lambda: [0, time.time(), 0])  # [count, last_time, total_bytes]
+arp_spoofing_attempts = defaultdict(lambda: [set(), time.time()])  # [claimed_macs, last_time]
+ssl_attacks = defaultdict(lambda: [0, time.time(), set()])  # [count, last_time, ssl_versions]
+brute_force_attempts = defaultdict(lambda: [{}, time.time()])  # [user_attempts, last_time]
 
 # Global settings
 blocklist = set()
@@ -38,6 +44,14 @@ ICMP_FLOOD_THRESHOLD = 50     # ICMP/ping floods
 UDP_FLOOD_THRESHOLD = 100     # UDP floods
 HTTP_FLOOD_THRESHOLD = 50     # HTTP floods (same IP, port 80/443)
 AUTH_FAILURE_THRESHOLD = 5    # Authentication failures
+DNS_AMP_THRESHOLD = 15       # DNS amplification attacks
+ARPSPOOF_MAC_THRESHOLD = 2   # ARP spoofing (multiple MACs for same IP)
+SSL_SCAN_THRESHOLD = 5       # SSL scans or downgrade attempts
+BRUTE_FORCE_THRESHOLD = 10   # Brute force login attempts
+TIME_WINDOW = 60             # Time window for rate-based detection (seconds)
+FINSCAN_THRESHOLD = 10       # FIN scan detection
+XMAS_THRESHOLD = 8           # XMAS scan detection
+NULLSCAN_THRESHOLD = 8       # NULL scan detection
 BLOCK_COMMAND = "iptables -I INPUT -s {} -j DROP"
 IP_TIMEOUT = 300  # seconds
 BLOCKLIST_FILE = "/var/log/openmammoth_lite.blocklist"
@@ -78,7 +92,7 @@ def notify_block(ip, reason):
     log_message(message, "BLOCK")
 
 def detect_attack(packet):
-    """Detect various network attacks from packet analysis"""
+    """Detect various network attacks from packet analysis with enhanced detection logic"""
     global blocklist
     
     # Skip packets from whitelisted IPs
@@ -98,27 +112,120 @@ def detect_attack(packet):
         if src in blocklist:
             return
             
-        # SYN Flood detection
+        # Enhanced SYN Flood detection (rate-based)
         if flags == 'S':
+            # Record packet timestamp for rate analysis
+            if len(syn_counts[src][2]) > 20:  # Keep only last 20 timestamps
+                syn_counts[src][2].pop(0)
+            syn_counts[src][2].append(now)
+            
             syn_counts[src][0] += 1
             syn_counts[src][1] = now
+            
+            # Detect rapid SYN bursts
+            if len(syn_counts[src][2]) > 10:  # Need at least 10 samples
+                rate = len(syn_counts[src][2]) / (syn_counts[src][2][-1] - syn_counts[src][2][0])
+                if rate > 5:  # More than 5 SYNs per second is suspicious
+                    log_message(f"High-rate SYN from {src}: {rate:.2f}/sec", "WARNING")
+                    
+            # Standard volume-based detection
             if syn_counts[src][0] > BLOCK_THRESHOLD:
-                block_ip(src, "SYN Flood Attack")
+                block_ip(src, f"SYN Flood Attack: {syn_counts[src][0]} attempts")
 
-        # Port Scan detection
+        # Advanced Port Scan detection
         connection_attempts[src][0].add(dst_port)
         connection_attempts[src][1] = now
-        if len(connection_attempts[src][0]) > PORT_SCAN_THRESHOLD:
-            block_ip(src, "Port Scan Attack")
         
-        # HTTP Flood detection (DOS)
+        # Track per-port scan frequency
+        if dst_port not in connection_attempts[src][2]:
+            connection_attempts[src][2][dst_port] = 1
+        else:
+            connection_attempts[src][2][dst_port] += 1
+            
+        # More sophisticated port scan detection
+        unique_ports = len(connection_attempts[src][0])
+        if unique_ports > PORT_SCAN_THRESHOLD:
+            # Calculate sequential port ratio
+            sorted_ports = sorted(list(connection_attempts[src][0]))
+            sequential = 0
+            for i in range(1, len(sorted_ports)):
+                if sorted_ports[i] == sorted_ports[i-1] + 1:
+                    sequential += 1
+            
+            seq_ratio = sequential / max(len(sorted_ports) - 1, 1)
+            scan_type = "Random Port Scan"
+            if seq_ratio > 0.7:
+                scan_type = "Sequential Port Scan"
+                
+            block_ip(src, f"{scan_type}: {unique_ports} ports probed")
+        
+        # FIN Scan detection (flags = FIN only)
+        if flags == 'F':
+            if 'finscan' not in connection_attempts[src][2]:
+                connection_attempts[src][2]['finscan'] = 1
+            else:
+                connection_attempts[src][2]['finscan'] += 1
+                
+            if connection_attempts[src][2]['finscan'] > FINSCAN_THRESHOLD:
+                block_ip(src, "FIN Scan Attack")
+                
+        # XMAS Scan detection (flags = FIN, PSH, URG)
+        if flags == 'FPU':
+            if 'xmasscan' not in connection_attempts[src][2]:
+                connection_attempts[src][2]['xmasscan'] = 1
+            else:
+                connection_attempts[src][2]['xmasscan'] += 1
+                
+            if connection_attempts[src][2]['xmasscan'] > XMAS_THRESHOLD:
+                block_ip(src, "XMAS Scan Attack")
+        
+        # NULL Scan detection (no flags)
+        if flags == '':
+            if 'nullscan' not in connection_attempts[src][2]:
+                connection_attempts[src][2]['nullscan'] = 1
+            else:
+                connection_attempts[src][2]['nullscan'] += 1
+                
+            if connection_attempts[src][2]['nullscan'] > NULLSCAN_THRESHOLD:
+                block_ip(src, "NULL Scan Attack")
+        
+        # Enhanced HTTP Flood detection (DOS)
         if dst_port in (80, 443, 8080):
             http_flood_counts[src][0] += 1
             http_flood_counts[src][1] = now
+            
+            # Extract and track HTTP User-Agent (if present in payload)
+            if packet.haslayer('Raw'):
+                payload = str(packet['Raw'].load)
+                user_agent = re.search(r'User-Agent: (.*?)\\r\\n', payload)
+                if user_agent:
+                    http_flood_counts[src][2].add(user_agent.group(1))
+                    
+            # Detect DoS with multiple user agents or high request rate
             if http_flood_counts[src][0] > HTTP_FLOOD_THRESHOLD:
-                block_ip(src, "HTTP Flood Attack")
+                reason = "HTTP Flood Attack"
+                if len(http_flood_counts[src][2]) > 5:  # Multiple user agents
+                    reason += " with multiple User-Agents"
+                block_ip(src, reason)
                 
-    # ICMP flood detection (Ping flood)
+        # SSL/TLS Attack detection
+        if dst_port == 443 and packet.haslayer('Raw'):
+            ssl_attacks[src][0] += 1
+            ssl_attacks[src][1] = now
+            
+            payload = str(packet['Raw'].load)
+            
+            # Check for SSL/TLS version indicators
+            if b'\x03\x00' in packet['Raw'].load:  # SSLv3
+                ssl_attacks[src][2].add('SSLv3')
+            if b'\x03\x01' in packet['Raw'].load:  # TLSv1.0
+                ssl_attacks[src][2].add('TLSv1.0')
+                
+            # Check for downgrade attempts or version scanning
+            if len(ssl_attacks[src][2]) >= SSL_SCAN_THRESHOLD:
+                block_ip(src, f"SSL/TLS version scanning detected ({len(ssl_attacks[src][2])} versions)")
+                
+    # Enhanced ICMP flood detection (Ping flood)
     if packet.haslayer(IP) and packet.haslayer(ICMP):
         src = packet[IP].src
         if src in blocklist:
@@ -126,19 +233,46 @@ def detect_attack(packet):
             
         icmp_flood_counts[src][0] += 1
         icmp_flood_counts[src][1] = now
+        
+        # Check both count and rate
         if icmp_flood_counts[src][0] > ICMP_FLOOD_THRESHOLD:
-            block_ip(src, "ICMP/Ping Flood Attack")
+            block_ip(src, f"ICMP/Ping Flood Attack: {icmp_flood_counts[src][0]} packets")
     
-    # UDP flood detection
+    # Enhanced UDP flood detection
     if packet.haslayer(IP) and packet.haslayer(UDP):
         src = packet[IP].src
+        dst_port = packet[UDP].dport
+        
         if src in blocklist:
             return
             
         udp_flood_counts[src][0] += 1
         udp_flood_counts[src][1] = now
+        
+        # Calculate total bytes as well
+        if packet.haslayer('Raw'):
+            udp_flood_counts[src][2] += len(packet['Raw'].load)
+        
+        # DNS Amplification detection
+        if dst_port == 53 and packet.haslayer('Raw'):
+            dns_amp_counts[src][0] += 1
+            dns_amp_counts[src][1] = now
+            
+            if packet.haslayer('Raw'):
+                dns_amp_counts[src][2] += len(packet['Raw'].load)
+                
+            # DNS query amplification - looking for suspicious DNS traffic
+            if dns_amp_counts[src][0] > DNS_AMP_THRESHOLD:
+                # High number of DNS queries
+                block_ip(src, f"DNS Amplification Attack: {dns_amp_counts[src][0]} queries")
+        
+        # Standard UDP flood
         if udp_flood_counts[src][0] > UDP_FLOOD_THRESHOLD:
-            block_ip(src, "UDP Flood Attack")
+            flood_size = "unknown"
+            if udp_flood_counts[src][2] > 0:
+                flood_size = f"{udp_flood_counts[src][2]/1024:.2f} KB"
+                
+            block_ip(src, f"UDP Flood Attack: {udp_flood_counts[src][0]} packets ({flood_size})")
 
 def block_ip(ip, reason):
     """Block an IP address using iptables"""
@@ -278,14 +412,55 @@ def stop_monitoring():
 
 
 def show_stats():
-    """Show attack statistics"""
+    """Show enhanced attack statistics"""
     print(f"{COLORS['cyan']}\n===== OpenMammoth-Lite Statistics ====={COLORS['reset']}")
-    print(f"\nBlocked IPs: {len(blocklist)}")
-    print(f"SYN Flood Attacks Detected: {len([ip for ip in syn_counts if syn_counts[ip][0] > BLOCK_THRESHOLD])}")
-    print(f"Port Scans Detected: {len([ip for ip in connection_attempts if len(connection_attempts[ip][0]) > PORT_SCAN_THRESHOLD])}")
+    print(f"\n{COLORS['white']}General Statistics:{COLORS['reset']}")
+    print(f"Blocked IPs: {len(blocklist)}")
+    
+    # Basic attack stats
+    print(f"\n{COLORS['white']}Basic Attack Detection:{COLORS['reset']}")
+    print(f"SYN Flood Attacks: {len([ip for ip in syn_counts if syn_counts[ip][0] > BLOCK_THRESHOLD])}")
+    print(f"Port Scans: {len([ip for ip in connection_attempts if len(connection_attempts[ip][0]) > PORT_SCAN_THRESHOLD])}")
     print(f"ICMP Flood Attacks: {len([ip for ip in icmp_flood_counts if icmp_flood_counts[ip][0] > ICMP_FLOOD_THRESHOLD])}")
     print(f"UDP Flood Attacks: {len([ip for ip in udp_flood_counts if udp_flood_counts[ip][0] > UDP_FLOOD_THRESHOLD])}")
     print(f"HTTP Flood Attacks: {len([ip for ip in http_flood_counts if http_flood_counts[ip][0] > HTTP_FLOOD_THRESHOLD])}")
+    
+    # Advanced attack stats
+    print(f"\n{COLORS['white']}Advanced Attack Detection:{COLORS['reset']}")
+    print(f"DNS Amplification Attacks: {len([ip for ip in dns_amp_counts if dns_amp_counts[ip][0] > DNS_AMP_THRESHOLD])}")
+    print(f"ARP Spoofing Attempts: {len([ip for ip in arp_spoofing_attempts if len(arp_spoofing_attempts[ip][0]) > ARPSPOOF_MAC_THRESHOLD])}")
+    print(f"SSL/TLS Version Scans: {len([ip for ip in ssl_attacks if len(ssl_attacks[ip][2]) >= SSL_SCAN_THRESHOLD])}")
+    
+    # Stealth scan stats
+    print(f"\n{COLORS['white']}Stealth Scan Detection:{COLORS['reset']}")
+    fin_scans = 0
+    xmas_scans = 0
+    null_scans = 0
+    
+    for ip in connection_attempts:
+        scan_data = connection_attempts[ip][2]
+        if scan_data.get('finscan', 0) > FINSCAN_THRESHOLD: 
+            fin_scans += 1
+        if scan_data.get('xmasscan', 0) > XMAS_THRESHOLD: 
+            xmas_scans += 1
+        if scan_data.get('nullscan', 0) > NULLSCAN_THRESHOLD: 
+            null_scans += 1
+            
+    print(f"FIN Scans: {fin_scans}")
+    print(f"XMAS Scans: {xmas_scans}")
+    print(f"NULL Scans: {null_scans}")
+    
+    # Performance stats
+    stats = {
+        "memory_entries": len(syn_counts) + len(connection_attempts) + len(icmp_flood_counts) + 
+                         len(udp_flood_counts) + len(http_flood_counts) + len(dns_amp_counts) + 
+                         len(ssl_attacks) + len(arp_spoofing_attempts),
+    }
+    
+    print(f"\n{COLORS['white']}Performance:{COLORS['reset']}")
+    print(f"Tracking {stats['memory_entries']} unique IPs")
+    print(f"Running since: {datetime.datetime.fromtimestamp(program_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Uptime: {int(time.time() - program_start_time)} seconds")
     
     # Show blocked IP details
     if blocklist:
@@ -301,6 +476,14 @@ def show_stats():
         except Exception:
             for ip in blocklist:
                 print(f"{COLORS['red']}{ip}{COLORS['reset']}")
+    
+    # Log file size
+    try:
+        if os.path.exists(LOG_FILE):
+            log_size = os.path.getsize(LOG_FILE) / 1024  # KB
+            print(f"\nLog size: {log_size:.2f} KB")  
+    except:
+        pass
 
 
 def manage_whitelist():
