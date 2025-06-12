@@ -583,12 +583,41 @@ def start_monitoring():
         input("Press Enter to continue...")
 
 
+def start_sniffing():
+    """Start packet sniffing using Scapy"""
+    global monitoring_active, selected_interface
+    try:
+        # Log the start of sniffing
+        log_message(f"Starting packet sniffing on interface: {selected_interface}")
+        
+        # Start sniffing packets on the selected interface
+        # The sniff function will continue until monitoring_active becomes False
+        sniff(iface=selected_interface, 
+              filter="ip", 
+              prn=detect_attack, 
+              store=0,
+              stop_filter=lambda x: not monitoring_active)
+              
+    except Exception as e:
+        log_message(f"Error in packet sniffing: {str(e)}", "ERROR")
+        print(f"{COLORS['red']}[!] Sniffing error: {str(e)}{COLORS['reset']}")
+        monitoring_active = False
+
+
 def stop_monitoring():
-    """Stop the network monitoring"""
-    global monitoring_active
-    monitoring_active = False
-    print(f"{COLORS['yellow']}[*] Stopping network monitoring...{COLORS['reset']}")
-    log_message("Network monitoring stopped")
+    """Stop network monitoring"""
+    global monitoring_active, detection_running
+    
+    if monitoring_active:
+        print(f"{COLORS['yellow']}[*] Stopping network monitoring...{COLORS['reset']}")
+        monitoring_active = False
+        detection_running = False
+        log_message("Network monitoring stopped")
+        print(f"{COLORS['green']}[+] Monitoring stopped{COLORS['reset']}")
+        input("Press Enter to continue...")
+    else:
+        print(f"{COLORS['yellow']}[*] Monitoring is not active{COLORS['reset']}")
+        input("Press Enter to continue...")
 
 
 def show_stats():
